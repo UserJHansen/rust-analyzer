@@ -2,17 +2,22 @@ use std::ops::Add;
 
 use crate::manga;
 
-const SCAN_PER_SECOND: i32 = 10;
+const SCAN_PER_MINUTE: i32 = 10;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ScanResult {
     pub found: i32,
     pub scanned: i32,
+    pub time_to_scan: i64,
 }
 
 impl ScanResult {
-    pub fn new(found: i32) -> Self {
-        Self { found, scanned: 1 }
+    pub fn new(found: i32, time_to_scan: i64) -> Self {
+        Self {
+            found,
+            time_to_scan,
+            scanned: 1,
+        }
     }
 }
 
@@ -23,104 +28,102 @@ impl Add for ScanResult {
         Self {
             found: self.found + other.found,
             scanned: self.scanned + other.scanned,
+            time_to_scan: self.time_to_scan + other.time_to_scan,
         }
     }
 }
 
 pub struct QueuedManga {
-    pub manga: manga::Manga,
+    pub chapters: Vec<i64>,
+    pub subs: f64,
+    pub comments: Vec<i64>,
     pub last_scan: i64,
 
     /// Number of comments per day
-    pub current_growth: i64,
+    pub current_growth: usize,
+
+    // Cache the last time and last chapter
+    pub last_chapter: i64,
+    pub last_chapter_time: i64,
 }
 
 impl QueuedManga {
-    pub fn new(
-        manga: manga::Manga,
-        at_time: chrono::DateTime<chrono::offset::FixedOffset>,
-    ) -> Self {
+    pub fn new(manga: &manga::Manga, at_time: i64, largest_subs: f64) -> Self {
         let total_comments_in_last_day = manga
             .comments
             .iter()
-            .filter(|c| at_time.signed_duration_since(c.date).num_days().abs() < 1)
+            .filter(|c| at_time - c.date < 60 * 24)
             .collect::<Vec<_>>()
             .len();
 
-        let mut total_replys_in_last_day: usize = 0;
-        for comment in &manga.comments {
-            total_replys_in_last_day += comment
-                .replies
-                .iter()
-                .filter(|r| at_time.signed_duration_since(r.date).num_days().abs() < 1)
-                .collect::<Vec<_>>()
-                .len();
-        }
-
-        let current_growth: i64 =
-            total_comments_in_last_day as i64 + total_replys_in_last_day as i64;
-
         Self {
-            manga,
-            last_scan: at_time.timestamp(),
-            current_growth,
+            chapters: manga.chapters.iter().map(|c| c.date).collect::<Vec<_>>(),
+            subs: manga.subs as f64 / largest_subs,
+            comments: manga.comments.iter().map(|c| c.date).collect::<Vec<_>>(),
+            last_scan: at_time as i64,
+            current_growth: total_comments_in_last_day,
+            last_chapter: 0,
+            last_chapter_time: 0,
         }
     }
 
-    pub fn from_mangas(
-        mangas: &[manga::Manga],
-        at_time: chrono::DateTime<chrono::offset::FixedOffset>,
-    ) -> Vec<Self> {
+    pub fn from_mangas(mangas: &[manga::Manga], at_time: i64) -> Vec<Self> {
+        let largest_subs = mangas
+            .iter()
+            .map(|manga| manga.subs)
+            .max()
+            .expect("No mangas in list") as f64;
+
         mangas
             .iter()
-            .map(|m| Self::new(m.clone(), at_time))
+            .map(|m| Self::new(m, at_time, largest_subs))
             .collect()
     }
 
-    pub fn scan(&mut self, at_time: chrono::DateTime<chrono::offset::FixedOffset>) -> ScanResult {
-        let comments_in_last_day = self
-            .manga
-            .comments
-            .iter()
-            .filter(|c| at_time.signed_duration_since(c.date).num_days().abs() < 1)
-            .collect::<Vec<_>>();
-        let new_comments = self
-            .manga
-            .comments
-            .iter()
-            .filter(|c| {
-                c.date.timestamp() > self.last_scan && c.date.timestamp() < at_time.timestamp()
-            })
-            .collect::<Vec<_>>();
+    pub fn scan(&mut self, at_time: i64) -> ScanResult {
+        let mut current_growth = 0;
+        let mut new_comments = 0;
+        let mut time_to_scan = 0;
+        for comment in &self.comments {
+            if at_time - *comment < 60 * 24 {
+                current_growth += 1;
+            }
+            if *comment > self.last_scan && *comment < at_time {
+                new_comments += 1;
 
-        let replies_in_last_day = self
-            .manga
-            .comments
-            .iter()
-            .flat_map(|c| {
-                c.replies
-                    .iter()
-                    .filter(|r| at_time.signed_duration_since(r.date).num_days().abs() < 1)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let new_replies = self
-            .manga
-            .comments
-            .iter()
-            .flat_map(|c| c.replies.iter())
-            .filter(|r| {
-                r.date.timestamp() > self.last_scan && r.date.timestamp() < at_time.timestamp()
-            })
-            .collect::<Vec<_>>();
+                time_to_scan += at_time - *comment;
+            }
+        }
 
-        let current_growth: i64 =
-            comments_in_last_day.len() as i64 + replies_in_last_day.len() as i64;
-
-        self.last_scan = at_time.timestamp();
+        self.last_scan = at_time;
         self.current_growth = current_growth;
 
-        ScanResult::new(new_comments.len() as i32 + new_replies.len() as i32)
+        ScanResult::new(new_comments, time_to_scan)
+    }
+
+    pub fn last_chapter(&self, at_time: i64) -> i64 {
+        if self.last_chapter_time == at_time {
+            return self.last_chapter;
+        }
+
+        let mut last_chapter = 0;
+        for chapter in &self.chapters {
+            if *chapter < at_time {
+                last_chapter = *chapter;
+            } else {
+                break;
+            }
+        }
+        last_chapter
+    }
+
+    pub fn calculate_score(&self, model: &Model, at_time: i64) -> f64 {
+        let mut score = 0.0;
+        score += model.subcount_weight * self.subs;
+        score += model.last_scan_weight * self.last_scan as f64;
+        score += model.current_growth_weight * self.current_growth as f64;
+        score += model.last_chap_weight * self.last_chapter(at_time) as f64;
+        score
     }
 }
 
@@ -133,15 +136,6 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new() -> Self {
-        Self {
-            subcount_weight: 0.0,
-            last_scan_weight: 0.0,
-            current_growth_weight: 0.0,
-            last_chap_weight: 0.0,
-        }
-    }
-
     pub fn from_weights(
         subcount_weight: f64,
         last_scan_weight: f64,
@@ -156,30 +150,22 @@ impl Model {
         }
     }
 
-    pub fn calculate_score(&self, manga: &QueuedManga) -> f64 {
-        let mut score = 0.0;
-        score += self.subcount_weight * manga.manga.subs as f64;
-        score += self.last_scan_weight * manga.last_scan as f64;
-        score += self.current_growth_weight * manga.current_growth as f64;
-        if let Some(last_chap) = manga.manga.chapters.last() {
-            score += self.last_chap_weight * last_chap.date.timestamp() as f64;
-        }
-        score
-    }
-
     pub fn simulate_minute(
         &self,
         manga: &mut Vec<QueuedManga>,
-        at_time: chrono::DateTime<chrono::offset::FixedOffset>,
+        at_time: i64,
         clients: i32, // number of clients
     ) -> ScanResult {
-        manga.sort_by(|a, b| self.calculate_score(a).total_cmp(&self.calculate_score(b)));
+        manga.sort_by(|a, b| {
+            a.calculate_score(self, at_time)
+                .total_cmp(&b.calculate_score(self, at_time))
+        });
 
         let mut i = 0;
-        let mut result = ScanResult::new(0);
+        let mut result = ScanResult::new(0, 0);
         for manga in manga.iter_mut() {
             i += 1;
-            if i >= clients * SCAN_PER_SECOND {
+            if i >= clients * SCAN_PER_MINUTE {
                 break;
             }
 

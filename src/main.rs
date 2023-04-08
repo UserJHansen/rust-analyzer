@@ -1,100 +1,115 @@
 use std::fs;
 
-mod calculate_peaks;
 mod detector_queuer;
 mod manga;
-mod schedule;
 
-use chrono::{FixedOffset, LocalResult::Single, TimeZone};
 use detector_queuer::Model;
-use schedule::Schedule;
 
 fn main() {
     let data = fs::read_to_string("./data.json").expect("Unable to load the data file");
 
-    let v: Vec<manga::Manga> = serde_json::from_str(&data).expect("Unable to decode JSON");
+    let mut mangas: Vec<manga::Manga> = serde_json::from_str(&data).expect("Unable to decode JSON");
 
+    // Print the mangas
     if false {
-        for manga in &v {
+        for manga in &mangas {
             println!("{}", manga)
         }
     }
 
-    // predict the schedule of the manga
-    if false {
-        let mut sched = Schedule::calculate_schedule(&v);
-        sched.sort_by(|(_, a), (_, b)| a.cmp(b));
-        sched
-            .iter()
-            .for_each(|(manga, schedule)| println!("{}: {:?}", manga.name, schedule));
-    }
-
     // Train the queueing model
-    if true {
-        let start = match TimeZone::with_ymd_and_hms(
-            &FixedOffset::east_opt(8 * 3600).unwrap(),
-            2023,
-            1,
-            1,
-            0,
-            0,
-            0,
-        ) {
-            Single(t) => t,
-            _ => panic!("Invalid time"),
-        };
+    let start = 27349320;
+    let days_to_scan = 365;
+    let scan_length = days_to_scan * 24 * 60;
+    let end = start + scan_length;
 
-        let model = Model::from_weights(
-            0.32082537252466403,
-            0.9566291030937526,
-            0.25397193250459693,
-            0.0013125164034918368,
-        );
-        // let model = Model::new();
-        let mut results: Vec<(f64, Model)> = Vec::new();
+    let model = Model::from_weights(
+        0.7745435606397895,
+        0.8173917173600213,
+        0.8296325741706723,
+        0.000846435401496537,
+    );
+    // let model = Model::new();
 
-        let threads = 12;
-        let mut handles = Vec::new();
+    let mut results: Vec<(f64, Model)> = Vec::new();
 
-        (0..threads).for_each(|_| {
-            let mut queue = detector_queuer::QueuedManga::from_mangas(&v, start);
+    let threads = 6;
+    let num_scans = 1_000_000;
+    let mut handles = Vec::new();
 
-            let mut model = model.clone();
-            let start = start.clone();
-            let handle = std::thread::spawn(move || {
-                let mut results: Vec<(f64, Model)> = Vec::new();
-                let mut best = 0.0;
-                for _ in 0..1000 {
-                    let mut result = detector_queuer::ScanResult {
-                        found: 0,
-                        scanned: 0,
-                    };
-                    for i in 0..20000 {
-                        let at_time = start + chrono::Duration::minutes(i);
-                        result = result + model.simulate_minute(&mut queue, at_time, 20);
-                    }
-                    let score = result.found as f64 / result.scanned as f64;
-                    results.push((score, model.clone()));
-                    if score > best {
-                        best = score;
-                        println!("New best: {:?} {}", model, score);
-                    }
+    mangas.iter_mut().for_each(|manga| {
+        manga
+            .comments
+            .retain(|comment| comment.date >= start && comment.date < end);
+    });
+
+    let mangas = mangas
+        .into_iter()
+        .filter(|manga| manga.comments.len() > 0 && manga.subs > 0 && manga.chapters.len() > 0)
+        .collect::<Vec<_>>();
+
+    let total = mangas
+        .iter()
+        .map(|manga| manga.comments.len())
+        .sum::<usize>();
+
+    println!("Total comments: {}", total);
+    println!("Scanning for {} days", days_to_scan);
+
+    (0..threads).for_each(|thread| {
+        let mut queue = detector_queuer::QueuedManga::from_mangas(&mangas, start);
+
+        let mut model = model.clone();
+        let handle = std::thread::spawn(move || {
+            let mut results: Vec<(f64, Model)> = Vec::new();
+            let mut best = 0.0;
+            let mut last_time = std::time::Instant::now();
+            println!("Starting thread {}", thread);
+            for scan in 0..num_scans {
+                if scan != 0 {
                     println!(
-                        "{:?}: {} / {} = {}",
-                        model, result.found, result.scanned, score
+                        "Time: {}s, {} scans/min",
+                        last_time.elapsed().as_secs(),
+                        (scan * scan_length) as f64 / (last_time.elapsed().as_secs() as f64 / 60.0)
                     );
-                    model.shuffle();
+                    println!(
+                        "Estimated time remaining: {}hrs",
+                        (num_scans - scan) as f64
+                            * (last_time.elapsed().as_secs() as f64 / scan as f64)
+                            / 3600.0
+                    );
+                    last_time = std::time::Instant::now();
                 }
-                results
-            });
-            handles.push(handle);
+
+                let mut result = detector_queuer::ScanResult {
+                    found: 0,
+                    scanned: 0,
+                    time_to_scan: 0,
+                };
+                for at_time in start..end {
+                    result = result + model.simulate_minute(&mut queue, at_time, 20);
+                }
+                let score = result.found as f64 / total as f64;
+                results.push((score, model.clone()));
+                if score > best {
+                    best = score;
+                    println!("New best: {:?} {}", model, score);
+                }
+                if score > 0.01 {
+                    println!("{:?}: {} / {} = {}", model, result.found, total, score);
+                }
+
+                model.shuffle();
+            }
+            results
         });
+        handles.push(handle);
+    });
 
-        for handle in handles {
-            results.extend(handle.join().unwrap());
-        }
-
-        results.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
-        println!("Best model: {:?}", results.last().unwrap());
+    for handle in handles {
+        results.extend(handle.join().unwrap());
     }
+
+    results.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap());
+    println!("Best model: {:?}", results.last().unwrap());
 }

@@ -1,19 +1,10 @@
-use chrono::{DateTime, NaiveDateTime};
 use serde::Deserialize;
 use std::fmt;
 
 #[derive(Deserialize, Clone)]
-pub struct Reply {
-    pub id: u32,
-    #[serde(deserialize_with = "parse_date")]
-    pub date: DateTime<chrono::offset::FixedOffset>,
-}
-#[derive(Deserialize, Clone)]
 pub struct Comment {
     pub id: u32,
-    #[serde(deserialize_with = "parse_date")]
-    pub date: DateTime<chrono::offset::FixedOffset>,
-    pub replies: Vec<Reply>,
+    pub date: i64,
 }
 
 #[derive(PartialEq, Eq, Clone)]
@@ -62,20 +53,7 @@ impl PartialOrd for ChapterNo {
 pub struct Chapter {
     #[serde(deserialize_with = "ChapterNo::parse")]
     pub chap_no: ChapterNo,
-    #[serde(deserialize_with = "parse_date")]
-    pub date: DateTime<chrono::offset::FixedOffset>,
-}
-
-fn parse_date<'de, D>(deserialiser: D) -> Result<DateTime<chrono::offset::FixedOffset>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s: &str = Deserialize::deserialize(deserialiser)?;
-    let datetime = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap();
-    Ok(DateTime::from_utc(
-        datetime,
-        chrono::FixedOffset::east_opt(8 * 3600).unwrap(),
-    ))
+    pub date: i64,
 }
 
 impl fmt::Display for Chapter {
