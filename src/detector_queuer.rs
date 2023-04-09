@@ -33,6 +33,7 @@ impl Add for ScanResult {
     }
 }
 
+#[derive(Clone)]
 pub struct QueuedManga {
     pub chapters: Vec<i64>,
     pub subs: f64,
@@ -43,7 +44,7 @@ pub struct QueuedManga {
     pub current_growth: usize,
 
     // Cache the last time and last chapter
-    pub last_chapter: i64,
+    pub last_chapter: usize,
     pub last_chapter_time: i64,
 }
 
@@ -101,33 +102,39 @@ impl QueuedManga {
         ScanResult::new(new_comments, time_to_scan)
     }
 
-    pub fn last_chapter(&self, at_time: i64) -> i64 {
+    pub fn last_chapter(&self, at_time: i64) -> usize {
         if self.last_chapter_time == at_time {
             return self.last_chapter;
         }
 
-        let mut last_chapter = 0;
-        for chapter in &self.chapters {
-            if *chapter < at_time {
-                last_chapter = *chapter;
-            } else {
-                break;
-            }
+        panic!("You should have called update_last_chapter first")
+    }
+
+    pub fn update_last_chapter(&mut self, at_time: i64) {
+        let mut last_chapter = self.last_chapter;
+
+        // Take advantage of the fact that the chapters are sorted and we only increment it forward
+        while (last_chapter + 1) < self.chapters.len() && self.chapters[last_chapter + 1] < at_time
+        {
+            last_chapter += 1;
         }
-        last_chapter
+
+        self.last_chapter_time = at_time;
+        self.last_chapter = last_chapter;
     }
 
     pub fn calculate_score(&self, model: &Model, at_time: i64) -> f64 {
         let mut score = 0.0;
         score += model.subcount_weight * self.subs;
-        score += model.last_scan_weight * self.last_scan as f64;
+        score += model.last_scan_weight * (at_time - self.last_scan) as f64;
         score += model.current_growth_weight * self.current_growth as f64;
-        score += model.last_chap_weight * self.last_chapter(at_time) as f64;
+        score +=
+            model.last_chap_weight * (at_time - self.chapters[self.last_chapter(at_time)]) as f64;
         score
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Model {
     pub subcount_weight: f64,
     pub last_scan_weight: f64,
@@ -156,7 +163,11 @@ impl Model {
         at_time: i64,
         clients: i32, // number of clients
     ) -> ScanResult {
-        manga.sort_by(|a, b| {
+        for manga in manga.iter_mut() {
+            manga.update_last_chapter(at_time);
+        }
+
+        manga.sort_unstable_by(|a, b| {
             a.calculate_score(self, at_time)
                 .total_cmp(&b.calculate_score(self, at_time))
         });
@@ -172,12 +183,5 @@ impl Model {
             result = result + manga.scan(at_time);
         }
         result
-    }
-
-    pub fn shuffle(&mut self) {
-        self.subcount_weight = rand::random();
-        self.last_scan_weight = rand::random();
-        self.current_growth_weight = rand::random();
-        self.last_chap_weight = rand::random();
     }
 }
