@@ -2,7 +2,7 @@ use std::ops::Add;
 
 use crate::manga;
 
-const SCAN_PER_MINUTE: i32 = 10;
+const SCAN_PER_MINUTE: i32 = 30;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ScanResult {
@@ -36,78 +36,53 @@ impl Add for ScanResult {
 #[derive(Clone)]
 pub struct QueuedManga {
     pub chapters: Vec<i64>,
-    pub subs: f64,
+    pub subs: usize,
     pub comments: Vec<i64>,
     pub last_scan: i64,
 
-    /// Number of comments per day
-    pub current_growth: usize,
-
     // Cache the last time and last chapter
-    pub last_chapter: usize,
-    pub last_chapter_time: i64,
+    last_chapter: usize,
+    last_chapter_time: i64,
 }
 
 impl QueuedManga {
-    pub fn new(manga: &manga::Manga, at_time: i64, largest_subs: f64) -> Self {
-        let total_comments_in_last_day = manga
-            .comments
-            .iter()
-            .filter(|c| at_time - c.date < 60 * 24)
-            .collect::<Vec<_>>()
-            .len();
-
+    pub fn new(manga: &manga::Manga, at_time: i64) -> Self {
         Self {
             chapters: manga.chapters.iter().map(|c| c.date).collect::<Vec<_>>(),
-            subs: manga.subs as f64 / largest_subs,
+            subs: manga.subs,
             comments: manga.comments.iter().map(|c| c.date).collect::<Vec<_>>(),
             last_scan: at_time as i64,
-            current_growth: total_comments_in_last_day,
             last_chapter: 0,
             last_chapter_time: 0,
         }
     }
 
     pub fn from_mangas(mangas: &[manga::Manga], at_time: i64) -> Vec<Self> {
-        let largest_subs = mangas
-            .iter()
-            .map(|manga| manga.subs)
-            .max()
-            .expect("No mangas in list") as f64;
-
-        mangas
-            .iter()
-            .map(|m| Self::new(m, at_time, largest_subs))
-            .collect()
+        mangas.iter().map(|m| Self::new(m, at_time)).collect()
     }
 
     pub fn scan(&mut self, at_time: i64) -> ScanResult {
-        let mut current_growth = 0;
         let mut new_comments = 0;
         let mut time_to_scan = 0;
         for comment in &self.comments {
-            if at_time - *comment < 60 * 24 {
-                current_growth += 1;
-            }
-            if *comment > self.last_scan && *comment < at_time {
+            if *comment > self.last_scan && *comment <= at_time {
                 new_comments += 1;
+
+                if at_time - *comment > 90 {
+                    println!(
+                        "Comment {} is too old, it was {} minutes old",
+                        comment,
+                        (at_time - *comment)
+                    )
+                }
 
                 time_to_scan += at_time - *comment;
             }
         }
 
         self.last_scan = at_time;
-        self.current_growth = current_growth;
 
         ScanResult::new(new_comments, time_to_scan)
-    }
-
-    pub fn last_chapter(&self, at_time: i64) -> usize {
-        if self.last_chapter_time == at_time {
-            return self.last_chapter;
-        }
-
-        panic!("You should have called update_last_chapter first")
     }
 
     pub fn update_last_chapter(&mut self, at_time: i64) {
@@ -123,60 +98,89 @@ impl QueuedManga {
         self.last_chapter = last_chapter;
     }
 
-    pub fn calculate_score(&self, model: &Model, at_time: i64) -> f64 {
-        let mut score = 0.0;
-        score += model.subcount_weight * self.subs;
-        score += model.last_scan_weight * (at_time - self.last_scan) as f64;
-        score += model.current_growth_weight * self.current_growth as f64;
-        score +=
-            model.last_chap_weight * (at_time - self.chapters[self.last_chapter(at_time)]) as f64;
-        score
+    pub fn should_scan(&self, at_time: i64, ranges: [usize; 5]) -> bool {
+        // Index of portion of the manga we are in
+        let mut index = 0;
+        while index < ranges.len() && ranges[index] > self.subs {
+            index += 1;
+        }
+
+        // Boost: parabola with vertex at (24h, 2) and passing through (0, 1) and (48h, 1)
+        // Desmos graph: y=\frac{-x\left(x-48\cdot60\right)}{48\cdot60\cdot60\cdot6}\left\{y>1\right\}
+        let mut boost = -(at_time - self.last_scan) * ((at_time - self.last_scan) - (48 * 60))
+            / (48 * 60 * 60 * 6);
+
+        if boost < 1 {
+            boost = 1;
+        }
+
+        // Lookup for how long to wait between scans in minutes
+        let wait_time = match index {
+            0 => 5,
+            1 => 10,
+            2 => 20,
+            3 => 40,
+            4 => 60,
+            _ => panic!("Invalid index"),
+        } / boost;
+        // };
+
+        at_time - self.last_scan > wait_time
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct Model {
-    pub subcount_weight: f64,
-    pub last_scan_weight: f64,
-    pub current_growth_weight: f64,
-    pub last_chap_weight: f64,
-}
+#[derive(Debug, Clone)]
+pub struct Model {}
 
 impl Model {
-    pub fn from_weights(
-        subcount_weight: f64,
-        last_scan_weight: f64,
-        current_growth_weight: f64,
-        last_chap_weight: f64,
-    ) -> Self {
-        Self {
-            subcount_weight,
-            last_scan_weight,
-            current_growth_weight,
-            last_chap_weight,
-        }
+    pub fn new() -> Self {
+        Self {}
     }
 
     pub fn simulate_minute(
         &self,
         manga: &mut Vec<QueuedManga>,
         at_time: i64,
-        clients: i32, // number of clients
+        ranges: [usize; 5], // number of subs in each range
+        clients: i32,       // number of clients
     ) -> ScanResult {
+        let mut allowance = clients * SCAN_PER_MINUTE;
+        let mut result = ScanResult::new(0, 0);
+
         for manga in manga.iter_mut() {
             manga.update_last_chapter(at_time);
+
+            if at_time - manga.last_scan > 90 {
+                println!(
+                    "Warning: manga {} has not been scanned in {} minutes",
+                    manga.subs,
+                    at_time - manga.last_scan
+                );
+
+                allowance -= 1;
+                if allowance < 0 {
+                    break;
+                }
+
+                result = result + manga.scan(at_time);
+            }
         }
 
-        manga.sort_unstable_by(|a, b| {
-            a.calculate_score(self, at_time)
-                .total_cmp(&b.calculate_score(self, at_time))
-        });
+        if allowance < 0 {
+            println!(
+                "Warning: clients * scan per minute is negative: {}",
+                allowance
+            );
+        }
 
-        let mut i = 0;
-        let mut result = ScanResult::new(0, 0);
         for manga in manga.iter_mut() {
-            i += 1;
-            if i >= clients * SCAN_PER_MINUTE {
+            manga.update_last_chapter(at_time);
+            if !manga.should_scan(at_time, ranges) {
+                continue;
+            }
+
+            allowance -= 1;
+            if allowance < 0 {
                 break;
             }
 

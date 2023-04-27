@@ -1,6 +1,7 @@
 ## Getting the data
 
 To get the data.json file you can put this js snippet in the browser, on the Mangasee website
+
 ```
 var output = {},
     error_count = 0,
@@ -25,14 +26,14 @@ fetch('https://mangasee123.com/_search.php').then((r) => r.json()).then((r) => {
         }), ++i * 35)
     })
     setTimeout(() => {
-        for (name in output) {            
+        for (name in output) {
             parsedOut.push({
                 name,
                 chapters: JSON.parse(/vm.Chapters = (.*?);\r\n\t\t\t/.exec(output[name][0])[1]).map(c => ({
                     chap_no: parseInt(c.Chapter),
                     date: Math.floor(Date.parse(c.Date)/1000/60)
                 })),
-                subs: parseInt(/vm.NumSubs = (.*?);/.exec(output[name])[1][0]),
+                subs: parseInt(/vm.NumSubs = (.*?);/.exec(output[name])[1]),
                 comments: output[name][1].flatMap((c) => [...c.Replies.map(r => ({
                         date: Math.floor(Date.parse(r.TimeCommented)/1000/60),
                         id: parseInt(r.CommentID)
@@ -49,3 +50,20 @@ fetch('https://mangasee123.com/_search.php').then((r) => r.json()).then((r) => {
 })
 
 ```
+
+## Findings
+
+Using the inbuilt settings over the year of 2022 you get:
+
+```
+Total comments: 95042
+Scanning for 365 days
+Score: 1
+Found Comments: 95042
+Scanned Mangas: 85900944
+Average scans to find a comment: 903
+Average diff between post time and scan time per comment: 7 minutes
+```
+
+To have accurate scanning and to reach these results you have to have the capability to scan at least
+180 mangas per minute, any less and you will not be able to keep scanning in a reasonable time frame.
