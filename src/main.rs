@@ -1,4 +1,4 @@
-use std::fs;
+use std::{collections::HashSet, fs};
 
 mod detector_queuer;
 mod manga;
@@ -38,7 +38,7 @@ fn main() {
             .retain(|comment| comment.date >= start && comment.date < end);
     });
 
-    let mangas = mangas
+    let mut mangas = mangas
         .into_iter()
         .filter(|manga| manga.comments.len() > 0 && manga.subs > 0 && manga.chapters.len() > 0)
         .collect::<Vec<_>>();
@@ -47,6 +47,74 @@ fn main() {
         .iter()
         .map(|manga| manga.comments.len())
         .sum::<usize>();
+
+    mangas.sort_unstable_by(|b, a| a.comments.len().partial_cmp(&b.comments.len()).unwrap());
+
+    let delta_info = mangas.iter().map(|manga| {
+        let mut previous_chap_date = 0;
+
+        manga
+            .comments
+            .iter()
+            .map(|comment| {
+                let delta = comment.date - previous_chap_date;
+                previous_chap_date = comment.date;
+                delta / 60 // Bin by hour
+            })
+            .collect::<Vec<_>>()
+    });
+
+    // Make it an array of dictionaries where the key is the delta and the value is the number of times it occurs
+    let delta_info = delta_info
+        .map(|delta_info| {
+            let delta_info =
+                delta_info
+                    .into_iter()
+                    .fold(std::collections::HashMap::new(), |mut map, delta| {
+                        *map.entry(delta).or_insert(0) += 1;
+                        map
+                    });
+
+            // Convert the hashmap to a vector of tuples
+            let mut delta_info = delta_info
+                .into_iter()
+                .map(|(delta, count)| (delta, count))
+                .collect::<Vec<_>>();
+
+            // Sort the vector by the delta
+            delta_info.sort_by(|a, b| a.0.cmp(&b.0));
+
+            delta_info
+        })
+        .collect::<Vec<_>>();
+
+    let all_y = delta_info
+        .iter()
+        .flat_map(|delta_info| delta_info.iter().map(|(y, _)| *y).collect::<Vec<_>>())
+        .collect::<HashSet<_>>();
+
+    let mut csv_data = String::new() + ",";
+    for y in all_y.iter() {
+        csv_data += &y.to_string();
+        csv_data += ",";
+    }
+    for (i, delta) in delta_info.iter().enumerate() {
+        csv_data += "\n";
+        csv_data += &i.to_string();
+        csv_data += ",";
+        for y in all_y.iter() {
+            if let Some((_, count)) = delta.iter().find(|(delta, _)| delta == y) {
+                csv_data += &count.to_string();
+                csv_data += ",";
+            } else {
+                csv_data += "0,";
+            }
+        }
+    }
+
+    fs::write("data.csv", csv_data).expect("Unable to write to file");
+
+    return;
 
     println!("Total comments: {}", total);
     println!("Scanning for {} days", days_to_scan);
